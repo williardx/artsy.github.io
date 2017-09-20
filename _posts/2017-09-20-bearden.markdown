@@ -1,0 +1,159 @@
+---
+layout: post
+title: "Bearden Post"
+date: 2017-09-20
+categories: [ruby rails]
+author: [jonallured]
+---
+One of the great things about working at Artsy is the ability engineers have to
+work in the open. The culture here has very much embraced the Open Source by
+Default ethos and my first project was able to be open source so I wanted to
+talk about it here.
+
+The project is called Bearden after Romare Bearden, a collogist. The reason this
+name fit was that the goal of the project was to take various pieces of
+organization data and "collage" them together to come up with a database of
+facts about these organizations. Given the nature of the project, Rails was a
+great fit and since the data was relational, we just used Postgres. The UI is
+very simple - there's a way to pick a CSV from your computer and upload it, then
+in the background we process the list and every so often we ship up the total,
+resolved dataset to Redshift for further work to be done.
+
+At a really basic level, all Bearden really does is take CSV files in and then
+spit different CSV files back out. The input CSV files typically come from
+Marketing - maybe through a list purchase or outsourcer work. For export, we
+resolve the data (more on that in a minute) and then write files to S3 before
+copying them into Redshift. From there our data scientists can slice and dice
+the data in whatever ways make sense.
+
+The part of the project that we spent the most time on was the ranking and
+resolving of data. Take a hypothetical gallery, Allured Gallery - a new
+organization that does not currently exist in the data. And further consider
+that we have two CSV files that contain data about this organization.
+
+```
+purchased_list.csv
+jon@allured_gallery.com,Allured Gallery
+
+outsourcer_work.csv
+info@allured_gallery.com,Allured Gallery
+spam@allured_gallery.com,Allured Gallery
+```
+
+You can I could look at the above data and it would be obvious to us that only
+the first email is really a good one - maybe the info@ email, but only if we
+didn't have the named one. But how do we tell the system to think this way?
+Well, there are certainly fancier ways, but the way we chose was to rank the
+sources of our data and let the best rank win. In this case, Marketing would
+indicate that the purchased list is better than the outsourcer data and when the
+data is resolved, we'd pick the bits of data with the better rank. This would
+show up in the export process like so:
+
+```
+export_list.csv
+jon@allured_gallery.com,Allured Gallery
+```
+
+And the data would look something like this:
+
+...insert relational.png here...
+
+Because the `jon@allured_gallery.com` email was tied to Source A, which has a
+lower (better) rank for emails, we'd pick that one instead of the other two.
+
+Next I want to talk about a cool library I found while researching how I could
+handle my state machine needs. What I wanted was something really simple - all I
+needed was a library that would prevent illegal state transitions and provide me
+a way to declare how state should transition. What I found was an excellent gem
+by Michel Martens called [MicroMachine][mm]. You should really go take a look at
+the repo - the lib folder has one file and you could probably read through it in
+about 5 minutes. I came away pretty sure I knew how this sucker worked without
+trying very hard, something that I certainly couldn't say about many of the
+other popular state machine libraries!
+
+[mm]: https://github.com/soveran/micromachine/
+
+My take on using this library was to subclass `MicroMachine` and use that
+subclass from within my ActiveRecord subclass. I added a column in Postgres
+called `state` and started wiring things up - here's a simplified version of
+where I landed:
+
+```ruby
+class ImportMicroMachine < MicroMachine
+  UNSTARTED = 'unstarted'.freeze
+  PARSE = 'parse'.freeze
+  PARSING = 'parsing'.freeze
+
+  def self.valid_states
+    machine = new(UNSTARTED)
+    machine.configure
+    machine.states
+  end
+
+  def self.start(initial_state, callback)
+    new(initial_state).tap { |machine| machine.configure(callback) }
+  end
+
+  def configure(callback = nil)
+    on(:any, &callback) if callback
+    self.when(PARSE, UNSTARTED => PARSING)
+  end
+end
+
+class Import < ApplicationRecord
+  validates :state, presence: true, inclusion: ImportMicroMachine.valid_states
+
+  def parse
+    machine.trigger ImportMicroMachine::PARSE
+    ParseCsvImportJob.perform_later id
+  end
+
+  private
+
+  def machine
+    @machine ||= ImportMicroMachine.start(state, method(:update_state))
+  end
+
+  def update_state(_)
+    update_attributes state: machine.state
+  end
+end
+```
+
+The declaritive part is in `ImportMicroMachine#configure`:
+
+```ruby
+self.when(PARSE, UNSTARTED => PARSING)
+```
+
+The way to read this is "when we trigger the parse transition, go from unstarted
+to parsing". We're defining what the valid triggers are along with the valid
+transitions. I did skip the first line in that method, let's take another look:
+
+```ruby
+on(:any, &callback) if callback
+```
+
+This little bit of config ties our state machine to the column in the database
+right here in the model:
+
+```ruby
+ImportMicroMachine.start(state, method(:update_state))
+```
+
+What these two lines set up is on any transition, we're going to call
+`Import#update_state`, which updates the string in the `state` column.
+
+One cool side effect of this structure is that we get to use this collaborator
+when it comes time for validation:
+
+```ruby
+validates :state, presence: true, inclusion: ImportMicroMachine.valid_states
+```
+
+Rather than the valid states being something the ActiveRecord model knows, we
+simply delegate that responsibility to the subclass that we collaborate with.
+This lets our already overwhelmed ActiveRecord subclass stay as focused as it
+can on being the glue between the database and our model-layer, instead of
+additionally being responsible for knowing the gritty details of state
+transitions.
